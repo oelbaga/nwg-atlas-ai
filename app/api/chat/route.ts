@@ -7,6 +7,7 @@ import { checkUserMessage } from '@/lib/guards';
 import { checkRateLimit, logRequest } from '@/lib/rate-limit';
 import { getSessionFromRequest } from '@/lib/auth';
 import type { ToolInput, RecentLeadsInput, SearchLeadsInput, AnalyticsBreakdownInput, ApiChatRequest } from '@/types';
+import { MAX_CONVERSATION_HISTORY, MAX_RESPONSE_TOKENS } from '@/lib/limits';
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -75,7 +76,7 @@ async function runToolLoop(
 
   let response = await anthropic.messages.create({
     model: MODEL,
-    max_tokens: 1024,
+    max_tokens: MAX_RESPONSE_TOKENS,
     system: systemPrompt,
     tools,
     messages,
@@ -133,7 +134,7 @@ async function runToolLoop(
 
     response = await anthropic.messages.create({
       model: MODEL,
-      max_tokens: 1024,
+      max_tokens: MAX_RESPONSE_TOKENS,
       system: systemPrompt,
       tools,
       messages,
@@ -197,8 +198,11 @@ export async function POST(req: NextRequest) {
     // Create a new conversation in Neon if this is the first message
     const conversationId = existingId ?? (await createConversation());
 
-    // Load history from Neon
-    const history = existingId ? await getMessages(conversationId) : [];
+    // Load history from Neon — cap at last 20 messages (10 pairs) to
+    // limit context size and avoid runaway token usage in long conversations
+    const history = existingId
+      ? (await getMessages(conversationId)).slice(-MAX_CONVERSATION_HISTORY)
+      : [];
 
     // Save the incoming user message
     await saveMessage(conversationId, 'user', message);

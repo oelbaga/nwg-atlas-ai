@@ -86,7 +86,8 @@ export interface SearchLeadsResult {
   search_field: string;
   search_value: string;
   found: boolean;
-  total_submissions: number;
+  total_found: number;
+  total_returned: number;
   submissions: LeadSearchMatch[];
   error?: string;
 }
@@ -112,6 +113,7 @@ export interface LeadRecord {
 export interface RecentLeadsResult {
   client_name: string;
   domain: string;
+  total_available: number;
   total_returned: number;
   leads: LeadRecord[];
   error?: string;

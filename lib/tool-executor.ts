@@ -1,6 +1,7 @@
 import pool from './mysql';
 import { getTrafficData, getTopPages, getTopEvents } from './ga4';
 import { checkQueryValue } from './guards';
+import { MAX_LEADS_RETURNED, MAX_SEARCH_RESULTS, MAX_BREAKDOWN_ROWS, MAX_ANALYTICS_BREAKDOWN_ROWS } from './limits';
 import type { ClientRecord, LeadsResult, AnalyticsResult, ToolInput, RecentLeadsInput, RecentLeadsResult, LeadRecord, SearchLeadsInput, SearchLeadsResult, SearchableField, AnalyticsBreakdownInput, AnalyticsBreakdownResult } from '@/types';
 import type { RowDataPacket } from 'mysql2';
 
@@ -67,7 +68,8 @@ export async function executeLeadsQuery(input: ToolInput): Promise<LeadsResult> 
            WHERE dt >= ? AND dt <= ?
              AND (email NOT LIKE '%@newworldgroup.com' OR email IS NULL)
            GROUP BY \`${breakdown}\`
-           ORDER BY count DESC`,
+           ORDER BY count DESC
+           LIMIT ${MAX_BREAKDOWN_ROWS}`,
           [startTs, endTs]
         );
         breakdownResults.push({ list: client.list_name, breakdown: rows });
@@ -107,11 +109,10 @@ export async function executeRecentLeads(input: RecentLeadsInput): Promise<Recen
 
   const clientGuard = checkQueryValue(client_name, 'client name');
   if (clientGuard.blocked) {
-    return { client_name, domain: '', total_returned: 0, leads: [], error: clientGuard.reason };
+    return { client_name, domain: '', total_available: 0, total_returned: 0, leads: [], error: clientGuard.reason };
   }
 
-  // Cap at 50 to keep responses manageable
-  const safeLimit = Math.min(Math.max(1, Math.floor(limit)), 50);
+  const safeLimit = Math.min(Math.max(1, Math.floor(limit)), MAX_LEADS_RETURNED);
 
   const clients = await resolveClient(client_name);
 
@@ -119,6 +120,7 @@ export async function executeRecentLeads(input: RecentLeadsInput): Promise<Recen
     return {
       client_name,
       domain: '',
+      total_available: 0,
       total_returned: 0,
       leads: [],
       error: `No client found matching "${client_name}". Please check the name and try again.`,
@@ -126,31 +128,40 @@ export async function executeRecentLeads(input: RecentLeadsInput): Promise<Recen
   }
 
   const allLeads: LeadRecord[] = [];
+  let totalAvailable = 0;
 
   for (const client of clients) {
     const table = `list_${client.id}`;
     try {
-      let query = `SELECT name, email, phone, form_name, dt as submitted_at,
-                          source, medium, campaign
-                   FROM \`${table}\`
-                   WHERE (email NOT LIKE '%@newworldgroup.com' OR email IS NULL)`;
-      const params: (string | number)[] = [];
+      const whereParams: (string | number)[] = [];
+      let whereClauses = `WHERE (email NOT LIKE '%@newworldgroup.com' OR email IS NULL)`;
 
       if (start_date) {
-        query += ` AND dt >= ?`;
-        params.push(`${start_date} 00:00:00`);
+        whereClauses += ` AND dt >= ?`;
+        whereParams.push(`${start_date} 00:00:00`);
       }
       if (end_date) {
-        query += ` AND dt <= ?`;
-        params.push(`${end_date} 23:59:59`);
+        whereClauses += ` AND dt <= ?`;
+        whereParams.push(`${end_date} 23:59:59`);
       }
 
-      query += ` ORDER BY dt DESC LIMIT ?`;
-      params.push(safeLimit);
+      // Run count and records queries in parallel
+      const [countResult, rows] = await Promise.all([
+        pool.execute<any[]>(
+          `SELECT COUNT(*) as count FROM \`${table}\` ${whereClauses}`,
+          whereParams
+        ),
+        pool.execute<any[]>(
+          `SELECT name, email, phone, form_name, dt as submitted_at,
+                  source, medium, campaign
+           FROM \`${table}\` ${whereClauses}
+           ORDER BY dt DESC LIMIT ?`,
+          [...whereParams, safeLimit]
+        ),
+      ]);
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const [rows] = await pool.execute<any[]>(query, params);
-      allLeads.push(...(rows as LeadRecord[]));
+      totalAvailable += Number(countResult[0][0]?.count ?? 0);
+      allLeads.push(...(rows[0] as LeadRecord[]));
     } catch {
       // Table may not exist — skip
     }
@@ -168,6 +179,7 @@ export async function executeRecentLeads(input: RecentLeadsInput): Promise<Recen
   return {
     client_name: clients[0].list_name,
     domain: clients[0].domain,
+    total_available: totalAvailable,
     total_returned: trimmed.length,
     leads: trimmed,
   };
@@ -196,12 +208,12 @@ export async function executeLeadSearch(input: SearchLeadsInput): Promise<Search
   // Layer 3 guard — validate free-text values before they touch any query
   const clientGuard = checkQueryValue(client_name, 'client name');
   if (clientGuard.blocked) {
-    return { client_name, domain: '', search_field, search_value, found: false, total_submissions: 0, submissions: [], error: clientGuard.reason };
+    return { client_name, domain: '', search_field, search_value, found: false, total_found: 0, total_returned: 0, submissions: [], error: clientGuard.reason };
   }
 
   const valueGuard = checkQueryValue(search_value, 'search value');
   if (valueGuard.blocked) {
-    return { client_name, domain: '', search_field, search_value, found: false, total_submissions: 0, submissions: [], error: valueGuard.reason };
+    return { client_name, domain: '', search_field, search_value, found: false, total_found: 0, total_returned: 0, submissions: [], error: valueGuard.reason };
   }
 
   // Guard: reject any field not in the whitelist
@@ -212,7 +224,8 @@ export async function executeLeadSearch(input: SearchLeadsInput): Promise<Search
       search_field,
       search_value,
       found: false,
-      total_submissions: 0,
+      total_found: 0,
+      total_returned: 0,
       submissions: [],
       error: `"${search_field}" is not a searchable field.`,
     };
@@ -227,7 +240,8 @@ export async function executeLeadSearch(input: SearchLeadsInput): Promise<Search
       search_field,
       search_value,
       found: false,
-      total_submissions: 0,
+      total_found: 0,
+      total_returned: 0,
       submissions: [],
       error: `No client found matching "${client_name}". Please check the name and try again.`,
     };
@@ -235,6 +249,7 @@ export async function executeLeadSearch(input: SearchLeadsInput): Promise<Search
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const allSubmissions: any[] = [];
+  let totalFound = 0;
 
   // For phone searches, normalise both sides to digits only so that
   // "2015555555", "(201) 555-5555", and "201-555-5555" all match each other.
@@ -244,38 +259,45 @@ export async function executeLeadSearch(input: SearchLeadsInput): Promise<Search
   for (const client of clients) {
     const table = `list_${client.id}`;
     try {
-      // Field name is safe — validated against whitelist above.
-      // For phone: strip formatting from the stored value using REGEXP_REPLACE
-      // so any format in the DB matches any format the user types.
+      const whereClause = isPhone
+        ? `WHERE REGEXP_REPLACE(\`phone\`, '[^0-9]', '') = ?`
+        : `WHERE \`${search_field}\` = ?`;
+
+      // Run count and records in parallel so we always know the real total
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const [rows] = await pool.execute<any[]>(
-        isPhone
-          ? `SELECT name, email, phone, form_name, dt as submitted_at,
-                    source, medium, campaign
-             FROM \`${table}\`
-             WHERE REGEXP_REPLACE(\`phone\`, '[^0-9]', '') = ?
-             ORDER BY dt DESC`
-          : `SELECT name, email, phone, form_name, dt as submitted_at,
-                    source, medium, campaign
-             FROM \`${table}\`
-             WHERE \`${search_field}\` = ?
-             ORDER BY dt DESC`,
-        [normalizedValue]
-      );
-      allSubmissions.push(...rows);
+      const [countResult, rows] = await Promise.all([
+        pool.execute<any[]>(
+          `SELECT COUNT(*) as count FROM \`${table}\` ${whereClause}`,
+          [normalizedValue]
+        ),
+        pool.execute<any[]>(
+          `SELECT name, email, phone, form_name, dt as submitted_at,
+                  source, medium, campaign
+           FROM \`${table}\` ${whereClause}
+           ORDER BY dt DESC
+           LIMIT ${MAX_SEARCH_RESULTS}`,
+          [normalizedValue]
+        ),
+      ]);
+
+      totalFound += Number(countResult[0][0]?.count ?? 0);
+      allSubmissions.push(...rows[0]);
     } catch {
       // Table may not exist — skip
     }
   }
+
+  const trimmed = allSubmissions.slice(0, MAX_SEARCH_RESULTS);
 
   return {
     client_name: clients[0].list_name,
     domain: clients[0].domain,
     search_field,
     search_value,
-    found: allSubmissions.length > 0,
-    total_submissions: allSubmissions.length,
-    submissions: allSubmissions,
+    found: totalFound > 0,
+    total_found: totalFound,
+    total_returned: trimmed.length,
+    submissions: trimmed,
   };
 }
 
@@ -284,7 +306,7 @@ export async function executeLeadSearch(input: SearchLeadsInput): Promise<Search
 export async function executeAnalyticsBreakdown(
   input: AnalyticsBreakdownInput
 ): Promise<AnalyticsBreakdownResult> {
-  const { client_name, start_date, end_date, breakdown, limit = 10 } = input;
+  const { client_name, start_date, end_date, breakdown, limit = MAX_ANALYTICS_BREAKDOWN_ROWS } = input;
 
   const term = `%${client_name}%`;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

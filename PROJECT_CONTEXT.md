@@ -1,6 +1,6 @@
-# Analytics AI — Project Context
+# NWG Atlas — Project Context
 
-Internal AI chatbot for **New World Group** employees. Ask natural-language questions about client leads (MySQL) and GA4 traffic data. Claude answers by calling structured tools; no SQL is ever written or exposed to the user.
+Internal AI chatbot for **New World Group** employees, named **Atlas**. Ask natural-language questions about client leads (MySQL) and GA4 traffic data. Claude answers by calling structured tools; no SQL is ever written or exposed to the user.
 
 ---
 
@@ -29,6 +29,8 @@ Internal AI chatbot for **New World Group** employees. Ask natural-language ques
 6. Claude decides which tool(s) to call. The server executes the tool, returns results to Claude, and Claude produces a final natural-language answer.
 7. The conversation (user + assistant messages) is persisted to Neon so multi-turn context works across the session.
 
+**Anthropic API key is only used for Claude calls.** MySQL queries, GA4 requests, and Neon reads/writes all run directly from the server using their own credentials — no Anthropic involvement. Each user message typically triggers 2 Claude API calls: one to decide which tool to use, one to turn the tool result into a natural-language answer.
+
 ---
 
 ## Claude tools
@@ -37,13 +39,36 @@ All tool definitions live in `lib/tools.ts`. Execution logic is in `lib/tool-exe
 
 | Tool | What it does |
 |---|---|
-| `query_leads` | Lead / form submission counts from MySQL, with optional breakdown by source / medium / campaign / form_name |
-| `get_recent_leads` | Returns individual lead records (name, email, phone, date, source) — defaults to last 10, max 50 |
-| `search_leads` | Finds leads matching a specific value in a specific field (email, phone, name, zip, source, etc.) |
+| `query_leads` | Lead / form submission counts from MySQL via `COUNT(*)` — always returns the real total, never capped |
+| `get_recent_leads` | Returns individual lead records (name, email, phone, date, source) — default 10, hard cap 25 |
+| `search_leads` | Finds leads matching a specific value in a specific field (email, phone, name, zip, source, etc.) — hard cap 25 |
 | `query_analytics` | GA4 totals — sessions, active users, pageviews for a date range |
 | `query_analytics_breakdown` | GA4 breakdowns — top pages by pageviews (`top_pages`) or top events by count (`top_events`) |
 
 Claude is given today's date in the system prompt and resolves natural-language dates (e.g. "this week", "last month") to `YYYY-MM-DD` before calling tools.
+
+---
+
+## Token management
+
+All limits are centralised in **`lib/limits.ts`** — change them in one place and they propagate everywhere.
+
+```
+MAX_LEADS_RETURNED        = 25   # get_recent_leads hard cap
+MAX_SEARCH_RESULTS        = 25   # search_leads hard cap
+MAX_BREAKDOWN_ROWS        = 25   # query_leads breakdown rows (source/medium/etc.)
+MAX_ANALYTICS_BREAKDOWN_ROWS = 10  # top_pages / top_events rows
+MAX_CONVERSATION_HISTORY  = 6    # past messages sent to Claude per request (3 pairs)
+MAX_RESPONSE_TOKENS       = 1024 # Claude max output tokens per call
+```
+
+**Why conversation history is capped at 6:** Every message in a conversation is re-sent to Claude on every turn. For a data query tool, questions are mostly independent — 3 back-and-forth pairs is enough to handle natural follow-ups ("what about last month?", "break that down by source") without accumulating expensive context.
+
+**Tool results and token cost:** When leads or analytics data is returned to Claude, that data is sent as input tokens. Large result sets = higher cost. The caps above bound the worst-case token usage per request.
+
+**Claude knows when results are truncated.** For `get_recent_leads` and `search_leads`, a separate `COUNT(*)` query runs in parallel with the records query. The tool result includes both `total_available`/`total_found` (real DB count) and `total_returned` (capped count), so Claude can tell the user "showing 25 of 40 results."
+
+`query_leads` always returns the real count via `COUNT(*)` — the cap never applies to count queries.
 
 ---
 
@@ -63,8 +88,8 @@ Phone search normalises both sides to digits only via `REGEXP_REPLACE` so any fo
 ```
 users
   id            UUID PK
-  username      VARCHAR(100) UNIQUE
-  display_name  VARCHAR(100) nullable
+  username      VARCHAR(100) UNIQUE       # used for login, stored lowercase
+  display_name  VARCHAR(100) nullable     # shown in the header UI
   password_hash VARCHAR(255)
   created_at    TIMESTAMPTZ
   last_login    TIMESTAMPTZ
@@ -82,12 +107,14 @@ messages
 
 request_log
   id            UUID PK
-  user_id       UUID FK → users.id (nullable)
+  user_id       UUID FK → users.id (nullable)  # no username stored — join to users if needed
   ip            VARCHAR(45)
   input_tokens  INT
   output_tokens INT
   created_at    TIMESTAMPTZ
 ```
+
+**Note:** `username` is intentionally not stored in `request_log` — only `user_id`. Join to the `users` table if you need the username, so a username change never causes stale data.
 
 ---
 
@@ -105,7 +132,8 @@ request_log
 
 - **`lib/auth.ts`** — `signToken`, `verifyToken`, cookie helpers. Session payload contains `{ userId, username, displayName }`.
 - **`proxy.ts`** — reads the session via `getSessionFromRequest(req)` (Edge-compatible, reads the cookie directly from the `NextRequest`).
-- **`app/api/auth/login/route.ts`** — bcrypt compare → sign JWT → set httpOnly cookie. Uses a valid 60-char dummy bcrypt hash for timing-attack protection when no user is found.
+- **`app/api/auth/login/route.ts`** — bcrypt compare → sign JWT → set httpOnly cookie.
+  - Uses a valid 60-character dummy bcrypt hash for timing-attack protection when no user row is found. The dummy hash must be exactly 60 chars in bcrypt format — a shorter/malformed hash causes `bcrypt.compare` to throw, which would 500 the route. The compare is also wrapped in try/catch as a second safety net.
 - **`app/api/auth/logout/route.ts`** — clears the session cookie.
 - The header shows `display_name` if set, falling back to `username`.
 
@@ -118,7 +146,7 @@ Implemented in `lib/rate-limit.ts` using the Neon `request_log` table.
 - **Per-IP per hour** — default 10 (env: `RATE_LIMIT_PER_IP_PER_HOUR`)
 - **Daily total across all users** — default 20 (env: `RATE_LIMIT_DAILY_TOTAL`)
 
-`logRequest()` is called non-blocking (`.catch(console.error)`) after each successful chat response and records IP, user_id, and token counts. Token counts are used to estimate Claude API cost.
+`logRequest()` is called non-blocking (`.catch(console.error)`) after each successful chat response and records IP, user_id, and token counts. Token counts are used to estimate Claude API cost via `getUsageStats()`.
 
 ---
 
@@ -132,6 +160,14 @@ GA4 errors are classified into three types and surfaced to the user with actiona
 - `not_found` — property ID no longer exists
 
 When GA4 fails, Claude always offers to pull lead data instead.
+
+`getTopEvents` automatically filters out noisy auto-collected GA4 events (`session_start`, `first_visit`, `user_engagement`) so results show meaningful interactions only.
+
+---
+
+## Suggestion chips
+
+The intro screen shows 6 dynamic question chips fetched from `GET /api/clients/recent`, which queries MySQL for the 6 most recently added unique client names (`GROUP BY list_name ORDER BY MAX(id) DESC LIMIT 6`). Each client gets a different question template (leads today, last 10 leads, traffic, leads this month, email search, leads by source). Hardcoded fallback names are shown instantly while the fetch resolves.
 
 ---
 
@@ -155,15 +191,17 @@ app/
     usage/route.ts          # GET  — usage stats from request_log
 
 components/
-  Header/                   # Logo (nwg_icon.svg), New Chat button, display name + logout
+  Header/                   # Logo (nwg_icon.svg), "NWG Atlas" brand name, display name + logout
   Chat/                     # Textarea, send button, message list, suggestion chips
   Message/                  # Renders a single chat bubble (markdown via react-markdown + remark-gfm)
+                            # Assistant avatar label: "Atlas"
   Suggestions/              # Intro screen with 6 dynamic question chips (fetched from /api/clients/recent)
 
 lib/
   auth.ts                   # JWT sign/verify, cookie helpers, SessionPayload type
   ga4.ts                    # getTrafficData, getTopPages, getTopEvents
   guards.ts                 # checkUserMessage, checkQueryValue
+  limits.ts                 # ALL app-wide caps and limits — single source of truth
   mysql.ts                  # Singleton mysql2 connection pool
   neon.ts                   # createConversation, saveMessage, getMessages
   neon-sql.ts               # Lazy singleton Neon client (avoids module-level instantiation)
@@ -176,11 +214,13 @@ scripts/
   init-db.mjs               # Creates/migrates all Neon tables — safe to re-run
   seed-user.mjs             # Creates/updates the default user from .env.local
   reset-data.mjs            # Truncates chat/log data, preserves specified user accounts
+                            # Edit KEEP_USERNAMES array inside to control which users survive
 
 proxy.ts                    # Next.js 16 middleware (named export 'proxy', not 'middleware')
 types/index.ts              # All shared TypeScript types
 public/nwg_icon.svg         # NWG logo (red SVG, used in header)
 .env.local.example          # Template for all required environment variables
+lib/limits.ts               # All caps/limits in one place
 ```
 
 ---
@@ -201,16 +241,16 @@ See `.env.local.example` for the full template. Key variables:
 
 | Variable | Purpose |
 |---|---|
-| `ANTHROPIC_API_KEY` | Claude API key |
+| `ANTHROPIC_API_KEY` | Claude API key — only used for chat, not for DB or GA4 calls |
 | `ANTHROPIC_MODEL` | Optional model override (default: `claude-opus-4-5`) |
 | `MYSQL_HOST/PORT/USER/PASSWORD/DATABASE` | Lead database connection |
 | `DATABASE_URL` | Neon Postgres connection string |
 | `JWT_SECRET` | Signs session tokens — generate with `openssl rand -base64 32` |
 | `DEFAULT_USERNAME` | Seed script: login username (stored lowercased) |
 | `DEFAULT_PASSWORD` | Seed script: login password |
-| `DEFAULT_DISPLAY_NAME` | Seed script: name shown in the header |
-| `RATE_LIMIT_PER_IP_PER_HOUR` | Default: 10 |
-| `RATE_LIMIT_DAILY_TOTAL` | Default: 20 |
+| `DEFAULT_DISPLAY_NAME` | Seed script: name shown in the header (optional, falls back to username) |
+| `RATE_LIMIT_PER_IP_PER_HOUR` | Default: 10 — also set in `lib/limits.ts` as fallback |
+| `RATE_LIMIT_DAILY_TOTAL` | Default: 20 — also set in `lib/limits.ts` as fallback |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | Full service account JSON as a single-line string |
 
 ---
@@ -221,3 +261,13 @@ See `.env.local.example` for the full template. Key variables:
 - `cookies()` is async — must be awaited.
 - Client components using `useSearchParams` must be wrapped in `<Suspense>`.
 - Neon client must not be instantiated at module level — use the lazy singleton in `lib/neon-sql.ts`.
+
+---
+
+## Known gotchas
+
+- **Dummy bcrypt hash** — must be exactly 60 characters in valid bcrypt format. A shorter hash causes `bcrypt.compare` to throw (not return false), which 500s the login route. Current dummy: `$2b$10$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ01234`
+- **`username` not stored in `request_log`** — only `user_id` is stored. This was a deliberate decision so username changes don't cause stale data. Join to `users` table if you need the name.
+- **GA4 `query_analytics_breakdown` limit** — the `limit` parameter in the tool caps at `MAX_ANALYTICS_BREAKDOWN_ROWS` (default 10). Claude uses this as the default if the user doesn't specify a number.
+- **Conversation history window** — only the last `MAX_CONVERSATION_HISTORY` (6) messages are sent to Claude per request. Older messages in a conversation are saved to Neon but not included in the API call context.
+- **Tool result token cost** — tool results (lead records, GA4 data) are sent back to Claude as input tokens. This is where most token usage comes from in complex queries, not the user's message itself.

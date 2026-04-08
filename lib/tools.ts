@@ -46,7 +46,7 @@ Optionally filter by a date range. The limit defaults to 10 and can go up to 50.
         },
         limit: {
           type: 'number',
-          description: 'Number of records to return (default 10, max 50)',
+          description: `Number of records to return (default 10, max 25)`,
         },
         start_date: {
           type: 'string',
