@@ -322,7 +322,7 @@ export async function executeLeadSearch(input: SearchLeadsInput): Promise<Search
     }
   }
 
-  const trimmed = allSubmissions.slice(0, MAX_SEARCH_RESULTS);
+  const trimmed = allSubmissions.slice(0, MAX_RECORDS_RETURNED);
 
   return {
     client_name: clients[0].list_name,
