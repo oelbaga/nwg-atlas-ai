@@ -92,7 +92,9 @@ export default function LoginPage() {
     <div className={styles.page}>
       <div className={styles.card}>
         <div className={styles.brand}>
-          <div className={styles.logo}>NW</div>
+          <div className={styles.logo}>
+            <img src="/nwg_icon.svg" alt="NWG" width={40} height={40} />
+          </div>
           <div className={styles.brandText}>
             <span className={styles.brandName}>NWG Atlas</span>
             <span className={styles.brandSub}>New World Group</span>
