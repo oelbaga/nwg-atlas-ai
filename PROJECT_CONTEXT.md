@@ -106,9 +106,7 @@ All lead queries deduplicate by email address — if the same email submitted mu
 - **Breakdown queries:** Deduplication is applied inside the subquery before grouping by source/medium/campaign/form_name, so breakdown counts reflect unique leads not raw submissions.
 
 ### All-time queries
-When no date range is specified (or the user says "all time"), Claude is required to confirm with the user before running the query, since all-time queries can be very large and expensive. Only after confirmation does it call the tool with no date filter.
-
-**Exception:** `search_leads` (searching for a specific email, phone, name, or ID) is always run across all time without asking — it's a targeted lookup, not a bulk data pull, so confirmation would be unnecessary friction.
+When no date range is specified, Claude confirms with the user before running a bulk query. Targeted lookups by unique identifiers are exempt. Controlled via the system prompt in `app/api/chat/route.ts`.
 
 ### Filtering
 - `@newworldgroup.com` emails are always excluded from all lead queries to filter out internal submissions. Claude is instructed to note this on every lead response: *"Note: newworldgroup.com emails are always excluded from results."* Controlled via `SHOW_EMAIL_EXCLUSION_NOTE` env var (defaults to `true` if unset, set to `'false'` to suppress).
@@ -318,4 +316,4 @@ See `.env.local.example` for the full template. Key variables:
 - **`comments` truncation** — in chat tool results, comments are truncated to 200 characters at the SQL level (`LEFT(comments, 200)`) to prevent spam or large free-text fields from inflating token payloads. In Excel exports, comments are fetched at 51 chars and trimmed to 50 + "…" if truncated, to keep column widths reasonable.
 - **Lead deduplication** — all lead counts and records are deduplicated by email at the SQL level before returning. Null-email records are always treated as unique. If you see lower counts than raw `SELECT COUNT(*)` in phpMyAdmin, this is expected and correct behaviour.
 - **Excel export** — generated in-memory via `exceljs` (no file storage). Uses the same dedup, exclusions, and source/medium/campaign normalization as the chat tools. `xlsx` was intentionally avoided due to high-severity CVEs; use `exceljs` for any future spreadsheet work. Optional columns (Keywords, Comments) are only included in the sheet if at least one record in the result set has a value for that column.
-- **All-time query confirmation** — Claude will always ask the user to confirm before running any query without a date range. This is enforced via the system prompt, not at the code level.
+- **All-time query confirmation** — enforced via the system prompt (`app/api/chat/route.ts`), not at the code level. Targeted lookups by unique identifiers are exempt.
