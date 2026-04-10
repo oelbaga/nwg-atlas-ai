@@ -9,8 +9,14 @@ import type { RowDataPacket } from 'mysql2';
 
 type ClientRow = ClientRecord & RowDataPacket;
 
-// Core columns present in every list_xxx table
-const LEAD_CORE_SELECT = `id, name, email, phone, dt as submitted_at, source, medium, campaign`;
+// Core columns present in every list_xxx table.
+// source, medium, campaign are fully normalized — lowercased with underscores
+// and hyphens replaced by spaces so all DB variants ("Google_ads", "Google_Ads",
+// "google-ads") come back as the same value ("google ads").
+const LEAD_CORE_SELECT = `id, name, email, phone, dt as submitted_at,
+  LOWER(REPLACE(REPLACE(source, '_', ' '), '-', ' ')) as source,
+  LOWER(REPLACE(REPLACE(medium, '_', ' '), '-', ' ')) as medium,
+  LOWER(REPLACE(REPLACE(campaign, '_', ' '), '-', ' ')) as campaign`;
 
 // Optional columns that may not exist in every list_xxx table
 const LEAD_OPTIONAL_COLUMNS = [
@@ -82,8 +88,13 @@ export async function executeLeadsQuery(input: ToolInput): Promise<LeadsResult> 
     };
   }
 
-  const startTs = `${start_date} 00:00:00`;
-  const endTs = `${end_date} 23:59:59`;
+  // Build date filter — omitted entirely when not provided (all-time query)
+  const dateWhere = start_date && end_date
+    ? `AND dt >= ? AND dt <= ?`
+    : '';
+  const dateParams: string[] = start_date && end_date
+    ? [`${start_date} 00:00:00`, `${end_date} 23:59:59`]
+    : [];
 
   let totalLeads = 0;
   const perList: { list: string; count: number }[] = [];
@@ -96,23 +107,30 @@ export async function executeLeadsQuery(input: ToolInput): Promise<LeadsResult> 
       if (breakdown) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const [rows] = await pool.execute<any[]>(
-          `SELECT \`${breakdown}\` as label, COUNT(*) as count
-           FROM \`${table}\`
-           WHERE dt >= ? AND dt <= ?
-             AND (email NOT LIKE '%@newworldgroup.com' OR email IS NULL)
-           GROUP BY \`${breakdown}\`
+          `SELECT label, COUNT(*) as count FROM (
+             SELECT LOWER(REPLACE(REPLACE(\`${breakdown}\`, '_', ' '), '-', ' ')) as label,
+                    IFNULL(LOWER(TRIM(email)), CAST(id AS CHAR)) as email_key
+             FROM \`${table}\`
+             WHERE (email NOT LIKE '%@newworldgroup.com' OR email IS NULL)
+               ${dateWhere}
+             GROUP BY label, email_key
+           ) as deduped
+           GROUP BY label
            ORDER BY count DESC
            LIMIT ${MAX_BREAKDOWN_ROWS}`,
-          [startTs, endTs]
+          dateParams
         );
         breakdownResults.push({ list: client.list_name, breakdown: rows });
       } else {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const [rows] = await pool.execute<any[]>(
-          `SELECT COUNT(*) as count FROM \`${table}\`
-           WHERE dt >= ? AND dt <= ?
-             AND (email NOT LIKE '%@newworldgroup.com' OR email IS NULL)`,
-          [startTs, endTs]
+          `SELECT COUNT(*) as count FROM (
+             SELECT MAX(id) FROM \`${table}\`
+             WHERE (email NOT LIKE '%@newworldgroup.com' OR email IS NULL)
+               ${dateWhere}
+             GROUP BY IFNULL(LOWER(TRIM(email)), CAST(id AS CHAR))
+           ) as deduped`,
+          dateParams
         );
         const count = Number(rows[0]?.count ?? 0);
         totalLeads += count;
@@ -181,14 +199,21 @@ export async function executeRecentLeads(input: RecentLeadsInput): Promise<Recen
       // Build SELECT dynamically so optional columns degrade to NULL if missing
       const selectClause = await buildLeadSelect(table);
 
-      // Run count and records queries in parallel
+      // Run count and records queries in parallel — both deduplicate by email
       const [countResult, rows] = await Promise.all([
         pool.execute<any[]>(
-          `SELECT COUNT(*) as count FROM \`${table}\` ${whereClauses}`,
+          `SELECT COUNT(*) as count FROM (
+             SELECT MAX(id) FROM \`${table}\` ${whereClauses}
+             GROUP BY IFNULL(LOWER(TRIM(email)), CAST(id AS CHAR))
+           ) as deduped`,
           whereParams
         ),
         pool.execute<any[]>(
-          `SELECT ${selectClause} FROM \`${table}\` ${whereClauses}
+          `SELECT ${selectClause} FROM \`${table}\`
+           WHERE id IN (
+             SELECT MAX(id) FROM \`${table}\` ${whereClauses}
+             GROUP BY IFNULL(LOWER(TRIM(email)), CAST(id AS CHAR))
+           )
            ORDER BY dt DESC LIMIT ?`,
           [...whereParams, safeLimit]
         ),
@@ -201,14 +226,24 @@ export async function executeRecentLeads(input: RecentLeadsInput): Promise<Recen
     }
   }
 
-  // Re-sort across all lists and trim to limit
+  // Re-sort across all lists (most recent first)
   allLeads.sort((a, b) => {
     const aDate = a.submitted_at ? new Date(a.submitted_at).getTime() : 0;
     const bDate = b.submitted_at ? new Date(b.submitted_at).getTime() : 0;
     return bDate - aDate;
   });
 
-  const trimmed = allLeads.slice(0, safeLimit);
+  // Cross-list dedup by email — first occurrence is most recent; null emails are always kept
+  const seenEmails = new Set<string>();
+  const deduped = allLeads.filter(lead => {
+    const key = lead.email ? lead.email.toLowerCase().trim() : null;
+    if (key === null) return true;
+    if (seenEmails.has(key)) return false;
+    seenEmails.add(key);
+    return true;
+  });
+
+  const trimmed = deduped.slice(0, safeLimit);
 
   return {
     client_name: clients[0].list_name,
@@ -288,14 +323,27 @@ export async function executeLeadSearch(input: SearchLeadsInput): Promise<Search
   // For phone searches, normalise both sides to digits only so that
   // "2015555555", "(201) 555-5555", and "201-555-5555" all match each other.
   const isPhone = search_field === 'phone';
-  const normalizedValue = isPhone ? digitsOnly(search_value) : search_value;
+
+  // For source/medium/campaign, strip spaces, underscores, and hyphens from
+  // both sides before comparing so "Google Ads", "Google_Ads", "google-ads"
+  // all match each other without being too loose like LIKE '%google%'.
+  const FUZZY_FIELDS = ['source', 'medium', 'campaign'] as const;
+  const isFuzzy = FUZZY_FIELDS.includes(search_field as typeof FUZZY_FIELDS[number]);
+
+  const normalizedValue = isPhone
+    ? digitsOnly(search_value)
+    : isFuzzy
+      ? search_value.toLowerCase().replace(/[\s_-]/g, '')
+      : search_value;
 
   for (const client of clients) {
     const table = `list_${client.id}`;
     try {
       const whereClause = isPhone
         ? `WHERE REGEXP_REPLACE(\`phone\`, '[^0-9]', '') = ?`
-        : `WHERE \`${search_field}\` = ?`;
+        : isFuzzy
+          ? `WHERE LOWER(REPLACE(REPLACE(REPLACE(\`${search_field}\`, '_', ''), '-', ''), ' ', '')) = ?`
+          : `WHERE \`${search_field}\` = ?`;
 
       // Run count and records in parallel so we always know the real total
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -304,11 +352,18 @@ export async function executeLeadSearch(input: SearchLeadsInput): Promise<Search
 
       const [countResult, rows] = await Promise.all([
         pool.execute<any[]>(
-          `SELECT COUNT(*) as count FROM \`${table}\` ${whereClause}`,
+          `SELECT COUNT(*) as count FROM (
+             SELECT MAX(id) FROM \`${table}\` ${whereClause}
+             GROUP BY IFNULL(LOWER(TRIM(email)), CAST(id AS CHAR))
+           ) as deduped`,
           [normalizedValue]
         ),
         pool.execute<any[]>(
-          `SELECT ${selectClause} FROM \`${table}\` ${whereClause}
+          `SELECT ${selectClause} FROM \`${table}\`
+           WHERE id IN (
+             SELECT MAX(id) FROM \`${table}\` ${whereClause}
+             GROUP BY IFNULL(LOWER(TRIM(email)), CAST(id AS CHAR))
+           )
            ORDER BY dt DESC
            LIMIT ${MAX_RECORDS_RETURNED}`,
           [normalizedValue]
@@ -322,7 +377,23 @@ export async function executeLeadSearch(input: SearchLeadsInput): Promise<Search
     }
   }
 
-  const trimmed = allSubmissions.slice(0, MAX_RECORDS_RETURNED);
+  // Sort by most recent, then cross-list dedup by email
+  allSubmissions.sort((a: any, b: any) => {
+    const aDate = a.submitted_at ? new Date(a.submitted_at).getTime() : 0;
+    const bDate = b.submitted_at ? new Date(b.submitted_at).getTime() : 0;
+    return bDate - aDate;
+  });
+
+  const seenEmails = new Set<string>();
+  const dedupedSubmissions = allSubmissions.filter((s: any) => {
+    const key = s.email ? s.email.toLowerCase().trim() : null;
+    if (key === null) return true;
+    if (seenEmails.has(key)) return false;
+    seenEmails.add(key);
+    return true;
+  });
+
+  const trimmed = dedupedSubmissions.slice(0, MAX_RECORDS_RETURNED);
 
   return {
     client_name: clients[0].list_name,

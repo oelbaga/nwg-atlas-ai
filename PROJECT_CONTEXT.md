@@ -94,6 +94,13 @@ MAX_RESPONSE_TOKENS          = 1024 # Claude max output tokens per call
 ### Search whitelist
 Fields searchable via `search_leads`: `id`, `email`, `phone`, `name`, `zip`, `address`, `broker`, `source`, `medium`, `campaign`, `keywords`, `assigned`. Field names are validated against this whitelist before use in any query.
 
+### Deduplication
+All lead queries deduplicate by email address — if the same email submitted multiple times, it counts as 1 and only the most recent record is returned. Records with a NULL email are each treated as unique (no email to deduplicate on).
+
+- **SQL level:** Uses a `MAX(id) ... GROUP BY IFNULL(LOWER(TRIM(email)), CAST(id AS CHAR))` subquery pattern applied to both COUNT and records queries in every lead tool. This ensures counts and returned records are always deduplicated before hitting the application layer.
+- **Cross-list JS level:** For clients with multiple forms, results from each list are merged, sorted by date DESC, then deduplicated again in JavaScript before trimming to the cap. First occurrence of each email (most recent) wins.
+- **Breakdown queries:** Deduplication is applied inside the subquery before grouping by source/medium/campaign/form_name, so breakdown counts reflect unique leads not raw submissions.
+
 ### Filtering
 - `@newworldgroup.com` emails are always excluded from all lead queries to filter out internal submissions. Claude is instructed to note this on every lead response: *"Note: newworldgroup.com emails are always excluded from results."* Controlled via `SHOW_EMAIL_EXCLUSION_NOTE` env var (defaults to `true` if unset, set to `'false'` to suppress).
 - Client lookup is always done with `LIKE` on `list_name` or `domain`, so partial names work.
@@ -293,3 +300,4 @@ See `.env.local.example` for the full template. Key variables:
 - **`list_xxx` schema variance** — not all client tables have the same columns. Always use `buildLeadSelect(table)` when querying lead tables — it checks `INFORMATION_SCHEMA` and substitutes `NULL` for any missing optional column so queries never silently fail and return empty results.
 - **newworldgroup.com exclusion** — internal emails are always filtered out of lead results at the query level. If a lead appears missing, check whether the submitter used a newworldgroup.com email before assuming a bug.
 - **`comments` truncation** — comments are truncated to 200 characters at the SQL level (`LEFT(comments, 200)`) to prevent spam or large free-text fields from inflating tool result token payloads.
+- **Lead deduplication** — all lead counts and records are deduplicated by email at the SQL level before returning. Null-email records are always treated as unique. If you see lower counts than raw `SELECT COUNT(*)` in phpMyAdmin, this is expected and correct behaviour.

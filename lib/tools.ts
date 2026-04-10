@@ -18,11 +18,11 @@ Optionally you can break down results by source, medium, campaign, or form_name.
         },
         start_date: {
           type: 'string',
-          description: 'Start date in YYYY-MM-DD format (inclusive)',
+          description: 'Start date in YYYY-MM-DD format (inclusive). Omit only when the user has explicitly confirmed they want all-time data.',
         },
         end_date: {
           type: 'string',
-          description: 'End date in YYYY-MM-DD format (inclusive)',
+          description: 'End date in YYYY-MM-DD format (inclusive). Omit only when the user has explicitly confirmed they want all-time data.',
         },
         breakdown: {
           type: 'string',
@@ -30,7 +30,7 @@ Optionally you can break down results by source, medium, campaign, or form_name.
           description: 'Optional: break down lead counts by this field instead of returning a single total',
         },
       },
-      required: ['client_name', 'start_date', 'end_date'],
+      required: ['client_name'],
     },
   },
   {
